@@ -1,0 +1,13 @@
+{
+    "refraction":  45,
+    "bezelWidth":  18,
+    "blur":  4,
+    "cornerRadius":  6,
+    "tintColor":  "#1A090909",
+    "rimHighlight":  0,
+    "marginLeft":  0,
+    "marginTop":  0,
+    "marginRight":  0,
+    "marginBottom":  0,
+    "excludeTaskbarFromCapture":  1
+}
