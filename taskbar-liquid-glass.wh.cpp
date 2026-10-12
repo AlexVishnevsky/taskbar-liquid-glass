@@ -2,12 +2,12 @@
 // @id              taskbar-liquid-glass
 // @name            Taskbar Liquid Glass
 // @description     Real refracting liquid glass backdrop behind the Windows 11 taskbar.
-// @version         0.3.0
+// @version         0.4.0
 // @author          AlexVishnevsky
 // @github          https://github.com/AlexVishnevsky
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lwindowsapp -luuid -luser32 -lgdi32 -ldwmapi -ld3d11 -ld2d1 -ldcomp
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lwindowsapp -luuid -luser32 -lgdi32 -ldwmapi -ld3d11 -ld2d1 -ldcomp -limm32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -73,6 +73,7 @@ to `Transparent`.
 
 #include <windows.h>
 #include <dwmapi.h>
+#include <imm.h>
 
 #include <inspectable.h>
 #include <d3d11.h>
@@ -1074,6 +1075,56 @@ bool ComputeLayout(HWND taskbar, Settings const& settings, Layout& layout) {
     return true;
 }
 
+bool IsTopmost(HWND hwnd) {
+    return (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+}
+
+// True if the glass sits under the taskbar with nothing visible in between
+// that could cover it.
+bool IsGlassBelowTaskbar(HWND taskbar, RECT const& glass) {
+    if (IsTopmost(taskbar) != IsTopmost(g_hwnd)) {
+        return false;
+    }
+    for (HWND hwnd = GetWindow(taskbar, GW_HWNDNEXT); hwnd;
+         hwnd = GetWindow(hwnd, GW_HWNDNEXT)) {
+        if (hwnd == g_hwnd) {
+            return true;
+        }
+        if (!IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER) == taskbar) {
+            continue;
+        }
+        RECT rect;
+        RECT intersection;
+        if (GetWindowRect(hwnd, &rect) &&
+            IntersectRect(&intersection, &rect, &glass)) {
+            return false;
+        }
+    }
+    // Not found below the taskbar at all: the glass is above it.
+    return false;
+}
+
+void PlaceGlassBelowTaskbar(HWND taskbar, RECT const& glass) {
+    constexpr UINT kFlags = SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+
+    // Inserting after the taskbar does not reliably carry a window across
+    // the topmost boundary, so the band is switched explicitly first. The
+    // glass is hidden meanwhile: HWND_TOPMOST briefly puts it over the
+    // taskbar.
+    bool taskbarTopmost = IsTopmost(taskbar);
+    if (taskbarTopmost != IsTopmost(g_hwnd)) {
+        ShowWindow(g_hwnd, SW_HIDE);
+        SetWindowPos(g_hwnd, taskbarTopmost ? HWND_TOPMOST : HWND_NOTOPMOST,
+                     0, 0, 0, 0, kFlags | SWP_NOMOVE | SWP_NOSIZE);
+    }
+
+    SetWindowPos(g_hwnd, taskbar, glass.left, glass.top,
+                 glass.right - glass.left, glass.bottom - glass.top, kFlags);
+    if (!IsWindowVisible(g_hwnd)) {
+        ShowWindow(g_hwnd, SW_SHOWNA);
+    }
+}
+
 void Tick() {
     if (g_stop) {
         DestroyWindow(g_hwnd);
@@ -1123,6 +1174,7 @@ void Tick() {
     }
 
     bool moved;
+    bool recreateFramePool = false;
     {
         std::lock_guard lock(g_mutex);
         if (restartCapture && !StartCaptureLocked(monitor)) {
@@ -1152,32 +1204,31 @@ void Tick() {
             if (g_regionValid) {
                 DrawLocked();
             } else if (!restartCapture && g_framePool) {
-                // The copied pixels belong to the old position. Recreating
-                // the pool makes the capture deliver a full fresh frame even
-                // if nothing on screen is changing.
-                try {
-                    g_framePool.Recreate(
-                        g_captureDevice,
-                        directx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2,
-                        g_captureItem.Size());
-                } catch (...) {
-                    g_needRestart = true;
-                }
+                recreateFramePool = true;
             }
         } else if (g_dumpRequested && g_regionValid) {
             DrawLocked();
         }
     }
 
-    // Stay right below the taskbar in the Z order. Inserting after it also
-    // makes this window follow the taskbar when it drops out of the topmost
-    // band for a full screen app.
-    bool visible = IsWindowVisible(g_hwnd);
-    if (moved || !visible || GetWindow(taskbar, GW_HWNDNEXT) != g_hwnd) {
-        SetWindowPos(g_hwnd, taskbar, layout.glass.left, layout.glass.top,
-                     layout.glass.right - layout.glass.left,
-                     layout.glass.bottom - layout.glass.top,
-                     SWP_NOACTIVATE | (visible ? 0 : SWP_SHOWWINDOW));
+    if (recreateFramePool) {
+        // The copied pixels belong to the old position. Recreating the pool
+        // makes the capture deliver a full fresh frame even if nothing on
+        // screen is changing. Done outside the lock: a frame callback may be
+        // waiting on it. Only this thread ever replaces the pool.
+        try {
+            g_framePool.Recreate(
+                g_captureDevice,
+                directx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2,
+                g_captureItem.Size());
+        } catch (...) {
+            g_needRestart = true;
+        }
+    }
+
+    if (moved || !IsWindowVisible(g_hwnd) ||
+        !IsGlassBelowTaskbar(taskbar, layout.glass)) {
+        PlaceGlassBelowTaskbar(taskbar, layout.glass);
     }
 }
 
@@ -1231,6 +1282,11 @@ void ThreadMain() {
     }
 
     RequestBorderlessCapture();
+
+    // Windows gives every window an owned IME helper window. It keeps its own
+    // topmost state, and once that disagrees with the glass window the pair
+    // can no longer be reordered and the glass gets stuck under other windows.
+    ImmDisableIME(GetCurrentThreadId());
 
     HINSTANCE instance = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
